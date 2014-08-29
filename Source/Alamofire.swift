@@ -39,11 +39,12 @@ public struct Alamofire {
 
     public enum ParameterEncoding {
         case URL
-        case JSON(options: NSJSONWritingOptions)
-        case PropertyList(format: NSPropertyListFormat, options: NSPropertyListWriteOptions)
+        case JSON//(NSJSONWritingOptions)
+        case PropertyList(NSPropertyListFormat, NSPropertyListWriteOptions)
+        case Custom((NSURLRequest, [String: AnyObject]?) -> (NSURLRequest, NSError?))
 
-        func encode(request: NSURLRequest, parameters: [String: AnyObject]?) -> (NSURLRequest, NSError?) {
-            if !parameters {
+        public func encode(request: NSURLRequest, parameters: [String: AnyObject]?) -> (NSURLRequest, NSError?) {
+            if parameters == nil {
                 return (request, nil)
             }
 
@@ -52,38 +53,7 @@ public struct Alamofire {
 
             switch self {
             case .URL:
-                func query(parameters: [String: AnyObject]) -> String! {
-                    func queryComponents(key: String, value: AnyObject) -> [(String, String)] {
-                        func dictionaryQueryComponents(key: String, dictionary: [String: AnyObject]) -> [(String, String)] {
-                            var components: [(String, String)] = []
-                            for (nestedKey, value) in dictionary {
-                                components += queryComponents("\(key)[\(nestedKey)]", value)
-                            }
-
-                            return components
-                        }
-
-                        func arrayQueryComponents(key: String, array: [AnyObject]) -> [(String, String)] {
-                            var components: [(String, String)] = []
-                            for value in array {
-                                components += queryComponents("\(key)[]", value)
-                            }
-
-                            return components
-                        }
-
-                        var components: [(String, String)] = []
-                        if let dictionary = value as? [String: AnyObject] {
-                            components += dictionaryQueryComponents(key, dictionary)
-                        } else if let array = value as? [AnyObject] {
-                            components += arrayQueryComponents(key, array)
-                        } else {
-                            components += (key, "\(value)")
-                        }
-
-                        return components
-                    }
-
+                func query(parameters: [String: AnyObject]) -> String {
                     var components: [(String, String)] = []
                     for key in sorted(Array(parameters.keys), <) {
                         let value: AnyObject! = parameters[key]
@@ -104,42 +74,57 @@ public struct Alamofire {
 
                 if encodesParametersInURL(Method.fromRaw(request.HTTPMethod)!) {
                     let URLComponents = NSURLComponents(URL: mutableRequest.URL, resolvingAgainstBaseURL: false)
-                    URLComponents.query = (URLComponents.query ? URLComponents.query + "&" : "") + query(parameters!)
+                    URLComponents.query = (URLComponents.query != nil ? URLComponents.query! + "&" : "") + query(parameters!)
                     mutableRequest.URL = URLComponents.URL
                 } else {
-                    if !mutableRequest.valueForHTTPHeaderField("Content-Type") {
+                    if mutableRequest.valueForHTTPHeaderField("Content-Type") == nil {
                         mutableRequest.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
                     }
 
                     mutableRequest.HTTPBody = query(parameters!).dataUsingEncoding(NSUTF8StringEncoding, allowLossyConversion: false)
                 }
-
-            case .JSON(let options):
-                let data = NSJSONSerialization.dataWithJSONObject(parameters, options: options, error: &error)
-
-                if data {
+            case .JSON://(let options):
+                let options = NSJSONWritingOptions.allZeros
+                if let data = NSJSONSerialization.dataWithJSONObject(parameters!, options: options, error: &error) {
                     let charset = CFStringConvertEncodingToIANACharSetName(CFStringConvertNSStringEncodingToEncoding(NSUTF8StringEncoding))
                     mutableRequest.setValue("application/json; charset=\(charset)", forHTTPHeaderField: "Content-Type")
                     mutableRequest.HTTPBody = data
                 }
             case .PropertyList(let (format, options)):
-                let data = NSPropertyListSerialization.dataWithPropertyList(parameters, format: format, options: options, error: &error)
-
-                if data {
+                if let data = NSPropertyListSerialization.dataWithPropertyList(parameters!, format: format, options: options, error: &error) {
                     let charset = CFStringConvertEncodingToIANACharSetName(CFStringConvertNSStringEncodingToEncoding(NSUTF8StringEncoding));
                     mutableRequest.setValue("application/x-plist; charset=\(charset)", forHTTPHeaderField: "Content-Type")
                     mutableRequest.HTTPBody = data
                 }
+            case .Custom(let closure):
+                return closure(request, parameters)
             }
 
             return (mutableRequest, error)
+        }
+
+        private func queryComponents(key: String, _ value: AnyObject) -> [(String, String)] {
+            var components: [(String, String)] = []
+            if let dictionary = value as? [String: AnyObject] {
+                for (nestedKey, value) in dictionary {
+                    components += queryComponents("\(key)[\(nestedKey)]", value)
+                }
+            } else if let array = value as? [AnyObject] {
+                for value in array {
+                    components += queryComponents("\(key)[]", value)
+                }
+            } else {
+                components.extend([(key, "\(value)")])
+            }
+
+            return components
         }
     }
 
     // MARK: -
 
-    class Manager {
-        class var sharedInstance: Manager {
+    public class Manager {
+        public class var sharedInstance: Manager {
             struct Singleton {
                 static let instance = Manager()
             }
@@ -153,8 +138,8 @@ public struct Alamofire {
 
         var automaticallyStartsRequests: Bool = true
 
-        lazy var defaultHeaders: [String: String] = {
-            // Accept-Language HTTP Header; see http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.3
+        public lazy var defaultHeaders: [String: String] = {
+            // Accept-Encoding HTTP Header; see http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.3
             let acceptEncoding: String = "gzip;q=1.0,compress;q=0.5"
 
             // Accept-Language HTTP Header; see http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.4
@@ -162,28 +147,27 @@ public struct Alamofire {
                 var components: [String] = []
                 for (index, languageCode) in enumerate(NSLocale.preferredLanguages() as [String]) {
                     let q = 1.0 - (Double(index) * 0.1)
-                    components += "\(languageCode);q=\(q)"
+                    components.append("\(languageCode);q=\(q)")
                     if q <= 0.5 {
                         break
                     }
                 }
 
-                return components.reduce("", {$0 == "" ? $1 : "\($0),\($1)"})
+                return join(",", components)
             }()
 
             // User-Agent Header; see http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.43
             let userAgent: String = {
-                if let info = NSBundle.mainBundle().infoDictionary {
-                    let executable: AnyObject? = info[kCFBundleExecutableKey]
-                    let bundle: AnyObject? = info[kCFBundleIdentifierKey]
-                    let version: AnyObject? = info[kCFBundleVersionKey]
-                    let os: AnyObject? = NSProcessInfo.processInfo()?.operatingSystemVersionString
+                let info = NSBundle.mainBundle().infoDictionary
+                let executable: AnyObject = info[kCFBundleExecutableKey] ?? "Unknown"
+                let bundle: AnyObject = info[kCFBundleIdentifierKey] ?? "Unknown"
+                let version: AnyObject = info[kCFBundleVersionKey] ?? "Unknown"
+                let os: AnyObject = NSProcessInfo.processInfo().operatingSystemVersionString ?? "Unknown"
 
-                    var mutableUserAgent = NSMutableString(string: "\(executable!)/\(bundle!) (\(version!); OS \(os!))") as CFMutableString
-                    let transform = NSString(string: "Any-Latin; Latin-ASCII; [:^ASCII:] Remove") as CFString
-                    if CFStringTransform(mutableUserAgent, nil, transform, 0) == 1 {
-                        return mutableUserAgent as NSString
-                    }
+                var mutableUserAgent = NSMutableString(string: "\(executable)/\(bundle) (\(version); OS \(os))") as CFMutableString
+                let transform = NSString(string: "Any-Latin; Latin-ASCII; [:^ASCII:] Remove") as CFString
+                if CFStringTransform(mutableUserAgent, nil, transform, 0) == 1 {
+                    return mutableUserAgent as NSString
                 }
 
                 return "Alamofire"
@@ -194,7 +178,7 @@ public struct Alamofire {
                     "User-Agent": userAgent]
         }()
 
-        required init(configuration: NSURLSessionConfiguration! = nil) {
+        required public init(configuration: NSURLSessionConfiguration! = nil) {
             self.delegate = SessionDelegate()
             self.session = NSURLSession(configuration: configuration, delegate: self.delegate, delegateQueue: self.operationQueue)
         }
@@ -205,11 +189,11 @@ public struct Alamofire {
 
         // MARK: -
 
-        func request(request: NSURLRequest) -> Request {
+        public func request(request: NSURLRequest) -> Request {
             var mutableRequest: NSMutableURLRequest! = request.mutableCopy() as NSMutableURLRequest
 
             for (field, value) in self.defaultHeaders {
-                if !mutableRequest.valueForHTTPHeaderField(field){
+                if mutableRequest.valueForHTTPHeaderField(field) == nil {
                     mutableRequest.setValue(value, forHTTPHeaderField: field)
                 }
             }
@@ -256,7 +240,7 @@ public struct Alamofire {
             var downloadTaskDidWriteData: ((NSURLSession!, NSURLSessionDownloadTask!, Int64, Int64, Int64) -> Void)?
             var downloadTaskDidResumeAtOffset: ((NSURLSession!, NSURLSessionDownloadTask!, Int64, Int64) -> Void)?
 
-            required init() {
+            required override init() {
                 self.subdelegates = Dictionary()
                 super.init()
             }
@@ -268,7 +252,7 @@ public struct Alamofire {
             }
 
             func URLSession(session: NSURLSession!, didReceiveChallenge challenge: NSURLAuthenticationChallenge!, completionHandler: ((NSURLSessionAuthChallengeDisposition, NSURLCredential!) -> Void)!) {
-                if self.sessionDidReceiveChallenge {
+                if self.sessionDidReceiveChallenge != nil {
                     completionHandler(self.sessionDidReceiveChallenge!(session, challenge))
                 } else {
                     completionHandler(.PerformDefaultHandling, nil)
@@ -283,7 +267,7 @@ public struct Alamofire {
 
             func URLSession(session: NSURLSession!, task: NSURLSessionTask!, willPerformHTTPRedirection response: NSHTTPURLResponse!, newRequest request: NSURLRequest!, completionHandler: ((NSURLRequest!) -> Void)!) {
                 var redirectRequest = request
-                if self.taskWillPerformHTTPRedirection {
+                if self.taskWillPerformHTTPRedirection != nil {
                     redirectRequest = self.taskWillPerformHTTPRedirection!(session, task, response, request)
                 }
 
@@ -321,7 +305,7 @@ public struct Alamofire {
             func URLSession(session: NSURLSession!, dataTask: NSURLSessionDataTask!, didReceiveResponse response: NSURLResponse!, completionHandler: ((NSURLSessionResponseDisposition) -> Void)!) {
                 var disposition: NSURLSessionResponseDisposition = .Allow
 
-                if self.dataTaskDidReceiveResponse {
+                if self.dataTaskDidReceiveResponse != nil {
                     disposition = self.dataTaskDidReceiveResponse!(session, dataTask, response)
                 }
 
@@ -344,7 +328,7 @@ public struct Alamofire {
             func URLSession(session: NSURLSession!, dataTask: NSURLSessionDataTask!, willCacheResponse proposedResponse: NSCachedURLResponse!, completionHandler: ((NSCachedURLResponse!) -> Void)!) {
                 var cachedResponse = proposedResponse
 
-                if self.dataTaskWillCacheResponse {
+                if self.dataTaskWillCacheResponse != nil {
                     cachedResponse = self.dataTaskWillCacheResponse!(session, dataTask, proposedResponse)
                 }
 
@@ -382,17 +366,17 @@ public struct Alamofire {
             override func respondsToSelector(selector: Selector) -> Bool {
                 switch selector {
                 case "URLSession:didBecomeInvalidWithError:":
-                    return self.sessionDidBecomeInvalidWithError ? true : false
+                    return (self.sessionDidBecomeInvalidWithError != nil)
                 case "URLSession:didReceiveChallenge:completionHandler:":
-                    return self.sessionDidReceiveChallenge ? true : false
+                    return (self.sessionDidReceiveChallenge != nil)
                 case "URLSessionDidFinishEventsForBackgroundURLSession:":
-                    return self.sessionDidFinishEventsForBackgroundURLSession ? true : false
+                    return (self.sessionDidFinishEventsForBackgroundURLSession != nil)
                 case "URLSession:task:willPerformHTTPRedirection:newRequest:completionHandler:":
-                    return self.taskWillPerformHTTPRedirection ? true : false
+                    return (self.taskWillPerformHTTPRedirection != nil)
                 case "URLSession:dataTask:didReceiveResponse:completionHandler:":
-                    return self.dataTaskDidReceiveResponse ? true : false
+                    return (self.dataTaskDidReceiveResponse != nil)
                 case "URLSession:dataTask:willCacheResponse:completionHandler:":
-                    return self.dataTaskWillCacheResponse ? true : false
+                    return (self.dataTaskWillCacheResponse != nil)
                 default:
                     return self.dynamicType.instancesRespondToSelector(selector)
                 }
@@ -402,25 +386,25 @@ public struct Alamofire {
 
     // MARK: -
 
-    class Request {
+    public class Request {
         private let delegate: TaskDelegate
 
         private var session: NSURLSession
         private var task: NSURLSessionTask { return self.delegate.task }
 
-        var request: NSURLRequest! { return self.task.originalRequest }
-        var response: NSHTTPURLResponse! { return self.task.response as? NSHTTPURLResponse }
-        var progress: NSProgress? { return self.delegate.progress }
+        public var request: NSURLRequest! { return self.task.originalRequest }
+        public var response: NSHTTPURLResponse! { return self.task.response as? NSHTTPURLResponse }
+        public var progress: NSProgress? { return self.delegate.progress }
 
         private init(session: NSURLSession, task: NSURLSessionTask) {
             self.session = session
 
             if task is NSURLSessionUploadTask {
                 self.delegate = UploadTaskDelegate(task: task)
-            } else if task is NSURLSessionDownloadTask {
-                self.delegate = DownloadTaskDelegate(task: task)
             } else if task is NSURLSessionDataTask {
                 self.delegate = DataTaskDelegate(task: task)
+            } else if task is NSURLSessionDownloadTask {
+                self.delegate = DownloadTaskDelegate(task: task)
             } else {
                 self.delegate = TaskDelegate(task: task)
             }
@@ -428,14 +412,14 @@ public struct Alamofire {
 
         // MARK: Authentication
 
-        func authenticate(HTTPBasic user: String, password: String) -> Self {
+        public func authenticate(HTTPBasic user: String, password: String) -> Self {
             let credential = NSURLCredential(user: user, password: password, persistence: .ForSession)
             let protectionSpace = NSURLProtectionSpace(host: self.request.URL.host, port: 0, `protocol`: self.request.URL.scheme, realm: nil, authenticationMethod: NSURLAuthenticationMethodHTTPBasic)
 
             return authenticate(usingCredential: credential, forProtectionSpace: protectionSpace)
         }
 
-        func authenticate(usingCredential credential: NSURLCredential, forProtectionSpace protectionSpace: NSURLProtectionSpace) -> Self {
+        public func authenticate(usingCredential credential: NSURLCredential, forProtectionSpace protectionSpace: NSURLProtectionSpace) -> Self {
             self.session.configuration.URLCredentialStorage.setCredential(credential, forProtectionSpace: protectionSpace)
 
             return self
@@ -443,7 +427,7 @@ public struct Alamofire {
 
         // MARK: Progress
 
-        func progress(closure: ((Int64, Int64, Int64) -> Void)? = nil) -> Self {
+        public func progress(closure: ((Int64, Int64, Int64) -> Void)? = nil) -> Self {
             if let uploadDelegate = self.delegate as? UploadTaskDelegate {
                 uploadDelegate.uploadProgress = closure
             } else if let downloadDelegate = self.delegate as? DownloadTaskDelegate {
@@ -455,36 +439,42 @@ public struct Alamofire {
 
         // MARK: Response
 
-        func response(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+        public func response(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
             return response({ (request, response, data, error) in
                                 return (data, error)
                             }, completionHandler: completionHandler)
         }
 
-        func response(priority: Int = DISPATCH_QUEUE_PRIORITY_DEFAULT, queue: dispatch_queue_t? = nil, serializer: (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?), completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+        public func response(priority: Int = DISPATCH_QUEUE_PRIORITY_DEFAULT, queue: dispatch_queue_t? = nil, serializer: (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?), completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
 
             dispatch_async(self.delegate.queue, {
                 dispatch_async(dispatch_get_global_queue(priority, 0), {
-                    let (responseObject: AnyObject?, error: NSError?) = serializer(self.request, self.response, self.delegate.data, self.delegate.error)
+                    if var error = self.delegate.error {
+                        dispatch_async(queue ?? dispatch_get_main_queue(), {
+                            completionHandler(self.request, self.response, nil, error)
+                        })
+                    } else {
+                        let (responseObject: AnyObject?, serializationError: NSError?) = serializer(self.request, self.response, self.delegate.data, nil)
 
-                    dispatch_async(queue ? queue : dispatch_get_main_queue(), {
-                        completionHandler(self.request, self.response, responseObject, error)
-                    })
+                        dispatch_async(queue ?? dispatch_get_main_queue(), {
+                            completionHandler(self.request, self.response, responseObject, serializationError)
+                        })
+                    }
                 })
             })
 
             return self
         }
 
-        func suspend() {
+        public func suspend() {
             self.task.suspend()
         }
 
-        func resume() {
+        public func resume() {
             self.task.resume()
         }
 
-        func cancel() {
+        public func cancel() {
             if let downloadDelegate = self.delegate as? DownloadTaskDelegate {
                 downloadDelegate.downloadTask.cancelByProducingResumeData { (data) in
                     downloadDelegate.resumeData = data
@@ -512,7 +502,7 @@ public struct Alamofire {
                 self.progress = NSProgress(totalUnitCount: 0)
 
                 let label: String = "com.alamofire.task-\(task.taskIdentifier)"
-                let queue = dispatch_queue_create(label.bridgeToObjectiveC().UTF8String, DISPATCH_QUEUE_SERIAL)
+                let queue = dispatch_queue_create((label as NSString).UTF8String, DISPATCH_QUEUE_SERIAL)
                 dispatch_suspend(queue)
                 self.queue = queue
             }
@@ -521,7 +511,7 @@ public struct Alamofire {
 
             func URLSession(session: NSURLSession!, task: NSURLSessionTask!, willPerformHTTPRedirection response: NSHTTPURLResponse!, newRequest request: NSURLRequest!, completionHandler: ((NSURLRequest!) -> Void)!) {
                 var redirectRequest = request
-                if self.taskWillPerformHTTPRedirection {
+                if self.taskWillPerformHTTPRedirection != nil {
                     redirectRequest = self.taskWillPerformHTTPRedirection!(session, task, response, request)
                 }
 
@@ -532,7 +522,7 @@ public struct Alamofire {
                 var disposition: NSURLSessionAuthChallengeDisposition = .PerformDefaultHandling
                 var credential: NSURLCredential?
 
-                if self.taskDidReceiveChallenge {
+                if self.taskDidReceiveChallenge != nil {
                     (disposition, credential) = self.taskDidReceiveChallenge!(session, task, challenge)
                 } else {
                     if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust {
@@ -548,7 +538,7 @@ public struct Alamofire {
 
             func URLSession(session: NSURLSession!, task: NSURLSessionTask!, needNewBodyStream completionHandler: ((NSInputStream!) -> Void)!) {
                 var bodyStream: NSInputStream?
-                if self.taskNeedNewBodyStream {
+                if self.taskNeedNewBodyStream != nil {
                     bodyStream = self.taskNeedNewBodyStream!(session, task)
                 }
 
@@ -556,6 +546,7 @@ public struct Alamofire {
             }
 
             func URLSession(session: NSURLSession!, task: NSURLSessionTask!, didCompleteWithError error: NSError!) {
+                self.error = error
                 dispatch_resume(self.queue)
             }
         }
@@ -573,7 +564,7 @@ public struct Alamofire {
             var dataTaskDidReceiveData: ((NSURLSession!, NSURLSessionDataTask!, NSData!) -> Void)?
             var dataTaskWillCacheResponse: ((NSURLSession!, NSURLSessionDataTask!, NSCachedURLResponse!) -> (NSCachedURLResponse))?
 
-            init(task: NSURLSessionTask) {
+            override init(task: NSURLSessionTask) {
                 self.mutableData = NSMutableData()
                 super.init(task: task)
             }
@@ -583,7 +574,7 @@ public struct Alamofire {
             func URLSession(session: NSURLSession!, dataTask: NSURLSessionDataTask!, didReceiveResponse response: NSURLResponse!, completionHandler: ((NSURLSessionResponseDisposition) -> Void)!) {
                 var disposition: NSURLSessionResponseDisposition = .Allow
 
-                if self.dataTaskDidReceiveResponse {
+                if self.dataTaskDidReceiveResponse != nil {
                     disposition = self.dataTaskDidReceiveResponse!(session, dataTask, response)
                 }
 
@@ -603,7 +594,7 @@ public struct Alamofire {
             func URLSession(session: NSURLSession!, dataTask: NSURLSessionDataTask!, willCacheResponse proposedResponse: NSCachedURLResponse!, completionHandler: ((NSCachedURLResponse!) -> Void)!) {
                 var cachedResponse = proposedResponse
 
-                if self.dataTaskWillCacheResponse {
+                if self.dataTaskWillCacheResponse != nil {
                     cachedResponse = self.dataTaskWillCacheResponse!(session, dataTask, proposedResponse)
                 }
 
@@ -636,7 +627,7 @@ extension Alamofire.Manager {
         }
 
         let request = Alamofire.Request(session: self.session, task: uploadTask)
-        if stream {
+        if stream != nil {
             request.delegate.taskNeedNewBodyStream = { _, _ in
                 return stream
             }
@@ -677,7 +668,7 @@ extension Alamofire.Request {
         // MARK: NSURLSessionTaskDelegate
 
         func URLSession(session: NSURLSession!, task: NSURLSessionTask!, didSendBodyData bytesSent: Int64, totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
-            if self.uploadProgress {
+            if self.uploadProgress != nil {
                 self.uploadProgress(bytesSent, totalBytesSent, totalBytesExpectedToSend)
             }
 
@@ -722,19 +713,19 @@ extension Alamofire.Manager {
 
     // MARK: Request
 
-    func download(request: NSURLRequest, destination: (NSURL, NSHTTPURLResponse) -> (NSURL)) -> Alamofire.Request {
+    public func download(request: NSURLRequest, destination: (NSURL, NSHTTPURLResponse) -> (NSURL)) -> Alamofire.Request {
         return download(.Request(request), destination: destination)
     }
 
     // MARK: Resume Data
 
-    func download(resumeData: NSData, destination: (NSURL, NSHTTPURLResponse) -> (NSURL)) -> Alamofire.Request {
+    public func download(resumeData: NSData, destination: (NSURL, NSHTTPURLResponse) -> (NSURL)) -> Alamofire.Request {
         return download(.ResumeData(resumeData), destination: destination)
     }
 }
 
 extension Alamofire.Request {
-    class func suggestedDownloadDestination(directory: NSSearchPathDirectory = .DocumentDirectory, domain: NSSearchPathDomainMask = .UserDomainMask) -> (NSURL, NSHTTPURLResponse) -> (NSURL) {
+    public class func suggestedDownloadDestination(directory: NSSearchPathDirectory = .DocumentDirectory, domain: NSSearchPathDomainMask = .UserDomainMask) -> (NSURL, NSHTTPURLResponse) -> (NSURL) {
 
         return { (temporaryURL, response) -> (NSURL) in
             if let directoryURL = NSFileManager.defaultManager().URLsForDirectory(.DocumentDirectory, inDomains: .UserDomainMask)[0] as? NSURL {
@@ -759,7 +750,7 @@ extension Alamofire.Request {
         // MARK: NSURLSessionDownloadDelegate
 
         func URLSession(session: NSURLSession!, downloadTask: NSURLSessionDownloadTask!, didFinishDownloadingToURL location: NSURL!) {
-            if self.downloadTaskDidFinishDownloadingToURL {
+            if self.downloadTaskDidFinishDownloadingToURL != nil {
                 let destination = self.downloadTaskDidFinishDownloadingToURL!(session, downloadTask, location)
                 var fileManagerError: NSError?
 
@@ -789,9 +780,9 @@ extension Alamofire.Request {
 // MARK: - Printable
 
 extension Alamofire.Request: Printable {
-    var description: String {
+    public var description: String {
         var description = "\(self.request.HTTPMethod) \(self.request.URL)"
-        if self.response {
+        if self.response != nil {
             description += " (\(self.response?.statusCode))"
         }
 
@@ -806,15 +797,15 @@ extension Alamofire.Request: DebugPrintable {
         let URL = self.request.URL!
 
         if self.request.HTTPMethod != "GET" {
-            components += "-X \(self.request.HTTPMethod)"
+            components.append("-X \(self.request.HTTPMethod)")
         }
 
         if let credentialStorage = self.session.configuration.URLCredentialStorage {
-            let protectionSpace = NSURLProtectionSpace(host: URL.host, port: URL.port ? URL.port : 0, `protocol`: URL.scheme, realm: URL.host, authenticationMethod: NSURLAuthenticationMethodHTTPBasic)
+            let protectionSpace = NSURLProtectionSpace(host: URL.host, port: URL.port ?? 0, `protocol`: URL.scheme, realm: URL.host, authenticationMethod: NSURLAuthenticationMethodHTTPBasic)
             if let credentials = credentialStorage.credentialsForProtectionSpace(protectionSpace)?.values.array {
                 if !credentials.isEmpty {
                     if let credential = credentials[0] as? NSURLCredential {
-                        components += "-u \(credential.user):\(credential.password)"
+                        components.append("-u \(credential.user):\(credential.password)")
                     }
                 }
             }
@@ -824,7 +815,7 @@ extension Alamofire.Request: DebugPrintable {
             if let cookies = cookieStorage.cookiesForURL(URL) as? [NSHTTPCookie] {
                 if !cookies.isEmpty {
                     let string = cookies.reduce(""){ $0 + "\($1.name)=\($1.value);" }
-                    components += "-b \"\(string.substringToIndex(string.endIndex.predecessor()))\""
+                    components.append("-b \"\(string.substringToIndex(string.endIndex.predecessor()))\"")
                 }
             }
         }
@@ -834,22 +825,22 @@ extension Alamofire.Request: DebugPrintable {
             case "Cookie":
                 continue
             default:
-                components += "-H \"\(field): \(value)\""
+                components.append("-H \"\(field): \(value)\"")
             }
         }
 
         if let HTTPBody = self.request.HTTPBody {
-            components += "-d \"\(NSString(data: HTTPBody, encoding: NSUTF8StringEncoding))\""
+            components.append("-d \"\(NSString(data: HTTPBody, encoding: NSUTF8StringEncoding))\"")
         }
 
         // TODO: -T arguments for files
 
-        components += "\"\(URL.absoluteString)\""
+        components.append("\"\(URL.absoluteString)\"")
 
         return join(" \\\n\t", components)
     }
 
-    var debugDescription: String {
+    public var debugDescription: String {
         return self.cURLRepresentation()
     }
 }
@@ -859,18 +850,18 @@ extension Alamofire.Request: DebugPrintable {
 // MARK: String
 
 extension Alamofire.Request {
-    class func stringResponseSerializer(encoding: NSStringEncoding = NSUTF8StringEncoding) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
+    public class func stringResponseSerializer(encoding: NSStringEncoding = NSUTF8StringEncoding) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
         return { (_, _, data, error) in
-            let string = NSString(data: data, encoding: encoding)
+            let string = NSString(data: data!, encoding: encoding)
             return (string, error)
         }
     }
 
-    func responseString(completionHandler: (NSURLRequest, NSHTTPURLResponse?, String?, NSError?) -> Void) -> Self {
+    public func responseString(completionHandler: (NSURLRequest, NSHTTPURLResponse?, String?, NSError?) -> Void) -> Self {
         return responseString(completionHandler: completionHandler)
     }
 
-    func responseString(encoding: NSStringEncoding = NSUTF8StringEncoding, completionHandler: (NSURLRequest, NSHTTPURLResponse?, String?, NSError?) -> Void) -> Self  {
+    public func responseString(encoding: NSStringEncoding = NSUTF8StringEncoding, completionHandler: (NSURLRequest, NSHTTPURLResponse?, String?, NSError?) -> Void) -> Self  {
         return response(serializer: Alamofire.Request.stringResponseSerializer(encoding: encoding), completionHandler: { request, response, string, error in
             completionHandler(request, response, string as? String, error)
         })
@@ -880,19 +871,19 @@ extension Alamofire.Request {
 // MARK: JSON
 
 extension Alamofire.Request {
-    class func JSONResponseSerializer(options: NSJSONReadingOptions = .AllowFragments) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
+    public class func JSONResponseSerializer(options: NSJSONReadingOptions = .AllowFragments) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
         return { (request, response, data, error) in
             var serializationError: NSError?
-            let JSON: AnyObject! = NSJSONSerialization.JSONObjectWithData(data as NSData, options: options, error: &serializationError)
+            let JSON: AnyObject! = NSJSONSerialization.JSONObjectWithData(data!, options: options, error: &serializationError)
             return (JSON, serializationError)
         }
     }
 
-    func responseJSON(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+    public func responseJSON(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
         return responseJSON(completionHandler: completionHandler)
     }
 
-    func responseJSON(options: NSJSONReadingOptions = .AllowFragments, completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+    public func responseJSON(options: NSJSONReadingOptions = .AllowFragments, completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
         return response(serializer: Alamofire.Request.JSONResponseSerializer(options: options), completionHandler: { (request, response, JSON, error) in
             completionHandler(request, response, JSON, error)
         })
@@ -902,20 +893,20 @@ extension Alamofire.Request {
 // MARK: Property List
 
 extension Alamofire.Request {
-    class func propertyListResponseSerializer(options: NSPropertyListReadOptions = 0) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
+    public class func propertyListResponseSerializer(options: NSPropertyListReadOptions = 0) -> (NSURLRequest, NSHTTPURLResponse?, NSData?, NSError?) -> (AnyObject?, NSError?) {
         return { (request, response, data, error) in
             var propertyListSerializationError: NSError?
-            let plist: AnyObject! = NSPropertyListSerialization.propertyListWithData(data as NSData, options: options, format: nil, error: &propertyListSerializationError)
+            let plist: AnyObject! = NSPropertyListSerialization.propertyListWithData(data!, options: options, format: nil, error: &propertyListSerializationError)
 
             return (plist, propertyListSerializationError)
         }
     }
 
-    func responsePropertyList(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+    public func responsePropertyList(completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
         return responsePropertyList(completionHandler: completionHandler)
     }
 
-    func responsePropertyList(options: NSPropertyListReadOptions = 0, completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
+    public func responsePropertyList(options: NSPropertyListReadOptions = 0, completionHandler: (NSURLRequest, NSHTTPURLResponse?, AnyObject?, NSError?) -> Void) -> Self {
         return response(serializer: Alamofire.Request.propertyListResponseSerializer(options: options), completionHandler: { (request, response, plist, error) in
             completionHandler(request, response, plist, error)
         })
@@ -935,9 +926,6 @@ extension Alamofire {
     // MARK: Request
 
     static func request(method: Method, _ URL: String, parameters: [String: AnyObject]? = nil, encoding: ParameterEncoding = .URL) -> Request {
-        var mutableRequest = NSMutableURLRequest(URL: NSURL(string: URL))
-        mutableRequest.HTTPMethod = method.toRaw()
-
         return Manager.sharedInstance.request(encoding.encode(URLRequest(method, URL), parameters: parameters).0)
     }
 
@@ -965,5 +953,3 @@ extension Alamofire {
         return Manager.sharedInstance.download(data, destination: destination)
     }
 }
-
-typealias AF = Alamofire
